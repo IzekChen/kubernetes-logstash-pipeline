@@ -1,0 +1,51 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-config-pd-webhook
+  namespace: logstash
+data:
+  logstash.yml: |-
+    http.port: 9600
+    xpack.monitoring.enabled: true
+    xpack.monitoring.elasticsearch.hosts: [ "http://infra-dress-elk-es7.ooapi.com:9200" ]
+
+  pipelines.yml: |
+    - pipeline.id: pd-webhook
+      path.config: "/usr/share/logstash/pipeline/pd-webhook.conf"
+      queue.type: memory
+      pipeline.workers: 2
+      pipeline.batch.size: 50
+      config.support_escapes: true
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config-pd-webhook
+  namespace: logstash
+data:
+  pd-webhook.conf: |-
+    input {
+      http {
+        port => 9981
+      }
+    }
+    filter {
+      mutate {
+        add_field => { "MTTA" => "%{[messages][log_entries]}" }
+        add_field => { "MTTA1" => "%{messages.log_entries}" }
+      }
+
+    }    
+    output {
+      stdout {
+        codec => rubydebug
+      }
+
+      elasticsearch {
+        index => "pd-webhook-%{+YYYY.MM}"
+        hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+        ecs_compatibility => 'v1'
+      }
+    }

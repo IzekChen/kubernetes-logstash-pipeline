@@ -1,0 +1,345 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-config-grafana-alerting
+  namespace: logstash
+data:
+  logstash.yml: |-
+    http.port: 9600
+    http.host: "0.0.0.0"
+    xpack.monitoring.enabled: true
+    xpack.monitoring.elasticsearch.hosts: [ "http://infra-dress-elk-es7.ooapi.com:9200" ]
+
+  pipelines.yml: |
+    - pipeline.id: grafana-alert-parser
+      path.config: "/usr/share/logstash/pipeline/grafana-alert-parser.conf"
+      queue.type: memory
+      pipeline.workers: 2
+      pipeline.batch.size: 50
+      config.support_escapes: true
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config-grafana-alerting
+  namespace: logstash
+data:
+  grafana-alert-parser.conf: |-
+    input {
+      http {
+        port => 9982
+        add_field => { "counter" => 1 }
+      }
+    }
+    filter {
+        if ![alert_source] {
+            mutate {
+                add_field => { 
+                    "alert_source" => "grafana" 
+                }
+            }
+        }
+        
+        if ![is_pagerduty] {
+            mutate {
+                add_field => {
+                    "is_pagerduty" => "0"
+                }
+            }
+        }
+
+        if ![supportowner] {
+            mutate {
+                add_field => {
+                    "supportowner" => "teechip"
+                }
+            }
+        }
+
+        if ![severity] {
+            mutate {
+                add_field => {
+                    "severity" => "warning"
+                }
+            }
+        }
+
+        if ![pd_service] {
+            mutate {
+                add_field => {
+                    "pd_service" => "SRE-staging"
+                }
+            }
+        }
+
+        if [ruleName] != "" {
+            elasticsearch {
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                index => "sp-alerts-raw-*"
+                query => " ruleName.keyword: %{[ruleName]} "
+                fields => {
+                  "alert_state" => "current_state"
+                }
+            }
+        }
+
+        if [pd_service] != "" {
+            elasticsearch {
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                index => "pd-svc-mapping"
+                query => " service.keyword: %{[pd_service]}"
+                enable_sort => false
+                fields => {
+                    "key" => "pd_key"
+                }
+            }
+        }
+
+        if ![element] {
+              mutate {
+                add_field => { 
+                  "element" => "Grafana"
+                  "element_type" => "grafana"
+                  "element_subtype" => "Grafana Alert"
+                }
+            }
+        }
+
+        if [state] == "alerting"{
+            mutate {
+                add_field => { 
+                  "timestamp"=> "%{@timestamp}"
+                  "retrigger_time"=> "%{@timestamp}"
+                  "type" => "open"
+                }
+                gsub => [
+                  "title", "\[Alerting\]\s|\[OK\]\s", ""
+                ]
+                convert => { "counter" => "integer" }
+            }
+            ruby {
+                code => '
+                    event.get("tags").each { |k, v|
+                        event.set(k,v)
+                    }
+                    event.remove("tags")
+                '
+            }
+            mutate {
+                add_field => {
+                  "alert_state" => "open"
+                }
+            }
+
+            if ![imageUrl] {
+              mutate {
+                  add_field => {
+                    "imageUrl" => "none"
+                  }
+              }              
+            }
+
+            if ![runbook] {
+              mutate {
+                  add_field => {
+                    "runbook" => "none"
+                  }
+              }              
+            }
+        }
+
+        if [current_state] == "open" {
+            mutate {
+                update => { "type" => "retrigger" }
+            }          
+        }
+
+        if [state] == "ok"{
+            mutate {
+                gsub => [
+                  "title", "\[Alerting\]\s|\[OK\]\s", ""
+                ]
+            }
+            if [tags] {
+                ruby {
+                    code => '
+                        if !event.get("tags").nil?
+                          event.get("tags").each { |k, v|
+                              event.set(k,v)
+                          }
+                          event.remove("tags")
+                        end
+                        
+                    '
+                }
+            }
+            elasticsearch {
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                index => "alerts-raw*"
+                query => 'ruleName.keyword: "%{[ruleName]}" AND type:open'
+                result_size => 1
+                tag_on_failure => ["_elasticsearch_lookup_failure"]
+                fields => {
+                    "@timestamp" => "started"
+                }
+            }
+            date {
+                match => ["[started]", "ISO8601"]
+                target => "[started]"
+            }
+            if [started] {
+                ruby {
+                    code => "event.set('duration_ms', (event.get('@timestamp') - event.get('started')) * 1000)"
+                }
+            }
+            mutate {
+                add_field => { 
+                    "type" => "closed"
+                }
+            } 
+        }
+    }    
+    output {
+      stdout {
+        codec => rubydebug
+      }
+      if [state] == "alerting" and [current_state] == "open" {
+          elasticsearch {
+            index => "sp-alerts-raw-%{+YYYY.MM}"
+            hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+            document_id => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+            ecs_compatibility => 'v1'
+            doc_as_upsert => true
+            action => "update"
+            script_lang => "painless"
+            script_type => "inline"
+            script => "
+              if (ctx._source.counter != null) {
+                ctx._source.counter++; ctx._source['timestamp'] = params.event.get('timestamp'); ctx._source['type'] = 'trigger'
+              }
+              "
+          }
+          if [is_pagerduty] == "1" {
+              pagerduty {
+                  event_type => "trigger"
+                  service_key => "%{pd_key}"
+                  incident_key => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+                  description => "%{title}"
+                  details => {
+                    timestamp => "%{@timestamp}"
+                    severity => "%{severity}"
+                    element => "%{element}"
+                    element_type => "%{element_type}"
+                    element_subtype => "%{element_subtype}"
+                    supportowner => "%{supportowner}"
+                    dashboard => "%{ruleUrl}"
+                    image => "%{imageUrl}"
+                    message => "%{message}"
+                    retrigger => "True"
+                    evalMatches => "%{evalMatches}"
+                    runbook => "%{runbook}"
+                    priority => "%{priority}"
+                  }
+              }
+          }
+          elasticsearch {
+              index => "alerts-raw-%{+YYYY.MM}"
+              hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+          }
+      }
+
+      else if [state] == "alerting" {
+          if [is_pagerduty] == "1" {
+              elasticsearch {
+                index => "sp-alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                document_id => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+                ecs_compatibility => 'v1'
+              }
+              elasticsearch {
+                index => "alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                ecs_compatibility => 'v1'
+              }
+              pagerduty {
+                event_type => "trigger"
+                service_key => "%{pd_key}"
+                incident_key => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+                description => "%{title}"
+                ecs_compatibility => 'v1'
+                details => {
+                  timestamp => "%{@timestamp}"
+                  severity => "%{severity}"
+                  element => "%{element}"
+                  element_type => "%{element_type}"
+                  element_subtype => "%{element_subtype}"
+                  supportowner => "%{supportowner}"
+                  dashboard => "%{ruleUrl}"
+                  image => "%{imageUrl}"
+                  message => "%{message}"
+                  evalMatches => "%{evalMatches}"
+                  runbook => "%{runbook}"
+                  priority => "%{priority}"
+                }
+              }
+          } else {
+              elasticsearch {
+                index => "sp-alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                document_id => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+                ecs_compatibility => 'v1'
+              } 
+              elasticsearch {
+                index => "alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                ecs_compatibility => 'v1'
+              }          
+          }
+      }
+
+      if [state] == "ok" {
+          if [is_pagerduty] == "1" {
+              elasticsearch {
+                index => "sp-alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                document_id => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+                ecs_compatibility => 'v1'
+                doc_as_upsert => true
+                action => "update"
+                script_lang => "painless"
+                script_type => "inline"
+                script => "ctx._source['alert_state'] = 'closed'; ctx._source.remove('counter')"
+              }
+              pagerduty {
+                event_type => "resolve"
+                service_key => "b6a8d50671744192b7fbb213d91916d7"
+                incident_key => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+                ecs_compatibility => 'v1'
+              }  
+              elasticsearch {
+                index => "alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                ecs_compatibility => 'v1'
+              }
+          } else {
+              elasticsearch {
+                index => "sp-alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                document_id => "grafana!%{orgId}!%{dashboardId}!%{panelId}!%{ruleId}"
+                ecs_compatibility => 'v1'
+                doc_as_upsert => true
+                action => "update"
+                script_lang => "painless"
+                script_type => "inline"
+                script => "ctx._source['alert_state'] = 'closed'; ctx._source.remove('counter')"
+              }   
+              elasticsearch {
+                index => "alerts-raw-%{+YYYY.MM}"
+                hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+                ecs_compatibility => 'v1'
+              }        
+          }      
+      }
+    }

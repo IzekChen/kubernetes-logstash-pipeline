@@ -1,0 +1,189 @@
+---
+
+# =============================================================================
+# Reference:
+#   + https://www.elastic.co/guide/en/beats/metricbeat/current/running-on-kubernetes.html
+#   + https://www.elastic.co/guide/en/beats/metricbeat/current/metricbeat-module-mongodb.html
+# =============================================================================
+# Parameters:
+# -----------------------------------------------------------------------------
+# - _ELASTICSEARCH_HOST
+# - _MONGO_HOST
+# -----------------------------------------------------------------------------
+# It is recommended to use the "sed" utility at build time to replace
+# parameters with values that make sense for your service.
+#
+# Example:
+# ```
+#     ...
+#     steps {
+#         sh """cp cron.yaml.template cron.yaml
+#         sed -i 's/_PARAMETER1/VALUE1/g' cron.yaml
+#         sed -i 's/_PARAMETER2/VALUE2/g' cron.yaml
+#         ...
+#         """
+#         sh "kubectl apply -f cron.yaml"
+#     }
+#     ...
+# ```
+# -----------------------------------------------------------------------------
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-config-01
+  namespace: logstash
+data:
+  logstash.yml: |-
+    http.port: 9600
+    xpack.monitoring.enabled: true
+    xpack.monitoring.elasticsearch.hosts: [ '${ELASTICSEARCH_HOST:infra-dress-elk-es7.ooapi.com}:9200' ]
+
+  pipelines.yml: |
+    - pipeline.id: jenkins
+      path.config: "/usr/share/logstash/pipeline/jenkins.conf"
+      queue.type: memory
+      pipeline.workers: 2
+      pipeline.batch.size: 50
+      config.support_escapes: true
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config-01
+  namespace: logstash
+data:
+  jenkins.conf: |-
+    input {
+      tcp {
+        port => 9980
+      }
+    }
+    filter {
+      json {
+        source => "message"
+      }
+
+    }    
+    output {
+      stdout {
+        codec => rubydebug
+      }
+
+      elasticsearch {
+        index => "jenkins_build-%{+YYYY.MM}"
+        hosts => ['${ELASTICSEARCH_HOST:infra-dress-elk-es7.ooapi.com}:9200']
+        pipeline => "jenkins_build"
+        ecs_compatibility => 'v1'
+      }
+    }
+
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logstash
+
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: logstash-pipeline-01
+  namespace: logstash
+  labels:
+    k8s-app: logstash-jenkins
+    app.kubernetes.io/name: eck-logstash
+    app.kubernets.io/component: logstash    
+spec:
+  selector:
+    matchLabels:
+      k8s-app: logstash-jenkins
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        k8s-app: logstash-jenkins
+        app.kubernetes.io/name: eck-logstash
+        app.kubernets.io/component: logstash     
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: logstash
+        image: camp0102/logstash-7.10.1-pagerduty:latest
+        ports:      
+          - name: ls-jenkins
+            containerPort: 9980
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: 0.5
+          limits:
+            memory: 2Gi
+            cpu: 2
+        env:
+          - name: ES_HOSTS
+            value: "http://infra-dress-elk-es7.ooapi.com:9200, http://172.31.2.7:9200, http://172.31.8.1:9200, http://172.31.11.18:9200"          
+        volumeMounts:
+        - name: config-volume 
+          mountPath: /usr/share/logstash/config
+        - name: pipeline-volume
+          mountPath: /usr/share/logstash/pipeline
+      volumes:
+      - name: config-volume
+        configMap:
+          name: logstash-config-01
+          items:
+          - key: logstash.yml
+            path: logstash.yml
+          - key: pipelines.yml
+            path: pipelines.yml
+      - name: pipeline-volume
+        configMap:
+          name: pipeline-config-01
+          items:
+          - key: jenkins.conf
+            path: jenkins.conf
+
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: logstash-pipeline-01
+  namespace: logstash
+  labels:
+    app.kubernetes.io/name: eck-logstash
+    app.kubernets.io/component: logstash
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-internal: 0.0.0.0/0
+spec:
+  type: LoadBalancer
+  selector:
+    k8s-app: logstash-jenkins
+  ports:  
+  - protocol: TCP
+    port: 9980
+    targetPort: 9980
+    name: ls-jenkins
+---
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: logstash-hpa-01
+  namespace: logstash
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: logstash-pipeline-01
+  minReplicas: 5
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 95

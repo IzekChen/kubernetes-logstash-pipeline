@@ -1,0 +1,53 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-config-01
+  namespace: logstash
+data:
+  logstash.yml: |-
+    http.port: 9600
+    http.host: "0.0.0.0"
+    xpack.monitoring.enabled: true
+    xpack.monitoring.elasticsearch.hosts: [ "http://infra-dress-elk-es7.ooapi.com:9200" ]
+
+  pipelines.yml: |
+    - pipeline.id: jenkins
+      path.config: "/usr/share/logstash/pipeline/jenkins.conf"
+      queue.type: memory
+      pipeline.batch.size: 125
+      pipeline.batch.delay: 50
+      config.support_escapes: true
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config-01
+  namespace: logstash
+data:
+  jenkins.conf: |-
+    input {
+      tcp {
+        port => 9980
+        tcp_keep_alive => true
+      }
+    }
+    filter {
+      json {
+        source => "message"
+      }
+
+    }    
+    output {
+     # stdout {
+     #   codec => rubydebug
+     # }
+
+      elasticsearch {
+        index => "jenkins_build-%{+YYYY.MM.dd}"
+        hosts => ["http://infra-dress-elk-es7.ooapi.com:9200"]
+        pipeline => "jenkins_build"
+        ecs_compatibility => 'v1'
+      }
+    }

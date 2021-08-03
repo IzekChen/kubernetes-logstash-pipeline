@@ -1,0 +1,98 @@
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: logstash-pipeline-pd-webhook
+  namespace: logstash
+  labels:
+    k8s-app: logstash-pipeline-pd-webhook
+    app.kubernetes.io/name: eck-logstash
+    app.kubernets.io/component: logstash    
+spec:
+  selector:
+    matchLabels:
+      k8s-app: logstash-pipeline-pd-webhook
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        k8s-app: logstash-pipeline-pd-webhook
+        app.kubernetes.io/name: eck-logstash
+        app.kubernets.io/component: logstash     
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: logstash
+        image: camp0102/logstash-7.10.1-pagerduty:latest
+        ports:      
+          - name: pd-webhook
+            containerPort: 9981
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: 0.5
+          limits:
+            memory: 2Gi
+            cpu: 2
+        env:
+          - name: ES_HOSTS
+            value: "http://infra-dress-elk-es7.ooapi.com:9200, http://172.31.2.7:9200, http://172.31.8.1:9200, http://172.31.11.18:9200"          
+        volumeMounts:
+        - name: config-volume 
+          mountPath: /usr/share/logstash/config
+        - name: pipeline-volume
+          mountPath: /usr/share/logstash/pipeline
+      volumes:
+      - name: config-volume
+        configMap:
+          name: logstash-config-pd-webhook
+          items:
+          - key: logstash.yml
+            path: logstash.yml
+          - key: pipelines.yml
+            path: pipelines.yml
+      - name: pipeline-volume
+        configMap:
+          name: pipeline-config-pd-webhook
+          items:
+          - key: pd-webhook.conf
+            path: pd-webhook.conf
+
+
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: logstash-pipeline-pd-webhook
+  namespace: logstash
+  labels:
+    app.kubernetes.io/name: eck-logstash
+    app.kubernets.io/component: logstash
+spec:
+  type: LoadBalancer
+  selector:
+    k8s-app: logstash-pipeline-pd-webhook
+  ports:  
+  - protocol: TCP
+    port: 9981
+    targetPort: 9981
+    name: pd-webhook
+---
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: logstash-hpa-pd-webhook
+  namespace: logstash
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: logstash-pipeline-pd-webhook
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 95
